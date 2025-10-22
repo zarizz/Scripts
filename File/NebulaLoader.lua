@@ -34,22 +34,35 @@ function MemoryManager:TrackAllocation(obj, type, stack)
         Type = type,
         Stack = stack,
         Timestamp = tick(),
-        Size = self:CalculateMemoryFootprint(obj)
+        Size = self:CalculateMemoryFootprint(obj, 0, {})
     }
     self:ScheduleCleanup()
 end
 
-function MemoryManager:CalculateMemoryFootprint(obj)
+function MemoryManager:CalculateMemoryFootprint(obj, depth, visited)
+    depth = depth or 0
+    visited = visited or {}
+    
+    if depth > 50 then return 10 end -- Prevent infinite recursion
+    
     local size = 0
+    local objId = tostring(obj)
+    
+    if visited[objId] then
+        return 0 -- Already visited
+    end
+    visited[objId] = true
+    
     if typeof(obj) == "Instance" then
         size = 100 -- Base instance size
         for _, child in ipairs(obj:GetChildren()) do
-            size = size + self:CalculateMemoryFootprint(child)
+            size = size + self:CalculateMemoryFootprint(child, depth + 1, visited)
         end
     elseif type(obj) == "table" then
         size = 50 -- Base table size
         for k, v in pairs(obj) do
-            size = size + self:CalculateMemoryFootprint(k) + self:CalculateMemoryFootprint(v)
+            size = size + self:CalculateMemoryFootprint(k, depth + 1, visited) 
+                      + self:CalculateMemoryFootprint(v, depth + 1, visited)
         end
     else
         size = 10 -- Default size for other types
@@ -62,7 +75,7 @@ function MemoryManager:DetectLeaks()
     local leaks = {}
     
     for id, data in pairs(self.AllocationTracker) do
-        if data.Object and (data.Object.Parent or data.Object:IsA("RBXScriptConnection")) then
+        if data.Object and (data.Object.Parent or (typeof(data.Object) == "RBXScriptConnection" and data.Object.Connected)) then
             active[id] = true
         else
             leaks[id] = data
@@ -73,6 +86,7 @@ function MemoryManager:DetectLeaks()
         warn(string.format("[NebulaUI Memory Leak Detected] %d objects", table.count(leaks)))
         for id, leakData in pairs(leaks) do
             warn(string.format("- %s allocated at %f", leakData.Type, leakData.Timestamp))
+            self.AllocationTracker[id] = nil
         end
     end
     
@@ -139,25 +153,35 @@ end
 
 function ReactiveSystem:UpdateState(name, newValue)
     local state = self.States[name]
-    if state then
-        state.previous = state.value
-        state.value = newValue
-        
-        if self.BatchUpdates then
-            table.insert(self.UpdateQueue, {name, newValue})
-        else
-            self:NotifySubscribers(name, newValue, state.previous)
+    if not state then return end
+    
+    -- Prevent unnecessary updates
+    if state.value == newValue then return end
+    
+    state.previous = state.value
+    state.value = newValue
+    
+    if self.BatchUpdates then
+        -- Update existing queued update instead of adding duplicate
+        for i, update in ipairs(self.UpdateQueue) do
+            if update[1] == name then
+                update[2] = newValue
+                return
+            end
         end
-        
-        table.insert(state.history, {
-            value = newValue,
-            timestamp = tick(),
-            previous = state.previous
-        })
-        
-        if #state.history > 100 then
-            table.remove(state.history, 1)
-        end
+        table.insert(self.UpdateQueue, {name, newValue})
+    else
+        self:NotifySubscribers(name, newValue, state.previous)
+    end
+    
+    table.insert(state.history, {
+        value = newValue,
+        timestamp = tick(),
+        previous = state.previous
+    })
+    
+    if #state.history > 100 then
+        table.remove(state.history, 1)
     end
 end
 
@@ -171,8 +195,12 @@ end
 function ReactiveSystem:NotifySubscribers(stateName, newValue, oldValue)
     local subscribers = self.Subscribers[stateName]
     if subscribers then
-        for _, callback in ipairs(subscribers) do
-            pcall(callback, newValue, oldValue)
+        for i = #subscribers, 1, -1 do
+            local success, result = pcall(subscribers[i], newValue, oldValue)
+            if not success then
+                table.remove(subscribers, i)
+                warn("Removed dead subscriber: " .. result)
+            end
         end
     end
 end
@@ -456,7 +484,34 @@ end
 
 function SecurityLayer:FilterXSS(input)
     if type(input) ~= "string" then return input end
-    return string.gsub(input, "[<>\"']", "")
+    
+    -- Comprehensive XSS protection
+    local patterns = {
+        "<script[^>]*>.-</script>",
+        "javascript:",
+        "onload=",
+        "onerror=",
+        "onclick=",
+        "vbscript:",
+        "expression%(",
+        "url%(",
+        "eval%("
+    }
+    
+    local sanitized = input
+    for _, pattern in ipairs(patterns) do
+        sanitized = string.gsub(sanitized, pattern, "")
+    end
+    
+    -- Additional encoding
+    sanitized = string.gsub(sanitized, "[<>\"']", {
+        ["<"] = "&lt;",
+        [">"] = "&gt;",
+        ['"'] = "&quot;",
+        ["'"] = "&#39;"
+    })
+    
+    return sanitized
 end
 
 function SecurityLayer:SanitizeText(input)
@@ -499,6 +554,12 @@ function PerformanceMonitor:StartContinuousMonitoring()
         self:CaptureFrameMetrics(deltaTime)
         self:CheckPerformanceThresholds()
         self:AdaptiveOptimization()
+        self:PredictiveScaling() -- NEW: Predictive scaling
+    end)
+    
+    -- Add memory pressure monitoring
+    self.MemoryPressureConnection = game:GetService("ScriptContext").MemoryPressure:Connect(function(pressure)
+        self:HandleMemoryPressure(pressure)
     end)
 end
 
@@ -550,6 +611,21 @@ end
 
 function PerformanceMonitor:AdaptiveOptimization()
     MemoryManager:OptimizeGC()
+end
+
+function PerformanceMonitor:PredictiveScaling()
+    -- Predictive scaling implementation
+    local currentMetrics = self.Metrics.FrameTime[#self.Metrics.FrameTime]
+    if currentMetrics and currentMetrics.fps < 45 then
+        self:ActivateEmergencyMeasures()
+    end
+end
+
+function PerformanceMonitor:HandleMemoryPressure(pressure)
+    if pressure == Enum.MemoryPressure.High then
+        self:ForceGarbageCollection()
+        self:TriggerPerformanceAlert("HIGH_MEMORY_PRESSURE", collectgarbage("count"))
+    end
 end
 
 -- Animation Engine
@@ -668,8 +744,12 @@ end
 function GestureSystem:TriggerGestureEvent(gesture, data)
     local callbacks = self.GestureCallbacks[gesture]
     if callbacks then
-        for _, callback in ipairs(callbacks) do
-            pcall(callback, data)
+        for i = #callbacks, 1, -1 do
+            local success, result = pcall(callbacks[i], data)
+            if not success then
+                table.remove(callbacks, i)
+                warn("Removed dead gesture callback: " .. result)
+            end
         end
     end
 end
